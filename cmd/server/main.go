@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -131,16 +132,23 @@ func main() {
 				return
 			}
 
-			c.JSON(http.StatusAccepted, gin.H{
-				"message": "dummy register handler",
-				"todo":    "replace with actual signup validation and insert query",
-				"user": gin.H{
-					"username": request.Username,
-					"name":     request.Name,
-					"email":    request.Email,
-					"phone":    request.Phone,
-				},
-			})
+			_, exists, err := store.findUserByUsername(request.Username)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to check username"})
+				return
+			}
+			if exists {
+				c.JSON(http.StatusConflict, gin.H{"message": "same username"})
+				return
+			}
+
+			user, err := store.createUser(request)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to create new user"})
+				return
+			}
+			c.JSON(http.StatusCreated, gin.H{"user": makeUserResponse(user)})
+
 		})
 
 		auth.POST("/login", func(c *gin.Context) {
@@ -212,6 +220,13 @@ func main() {
 				return
 			}
 
+			if err := store.deleteUser(user.Username); err != nil {
+				c.JSON(http.StatusUnauthorized, gin.H{"message": "delete user fail"})
+				return
+			}
+			sessions.delete(token)
+			clearAuthorizationCookie(c)
+
 			c.JSON(http.StatusAccepted, gin.H{
 				"message": "dummy withdraw handler",
 				"todo":    "replace with password check and account delete logic",
@@ -249,16 +264,28 @@ func main() {
 				c.JSON(http.StatusUnauthorized, gin.H{"message": "missing authorization token"})
 				return
 			}
+
 			user, ok := sessions.lookup(token)
 			if !ok {
 				c.JSON(http.StatusUnauthorized, gin.H{"message": "invalid authorization token"})
 				return
 			}
 
+			if request.Amount <= 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"message": "amount positive"})
+				return
+			}
+
+			updated, err := store.deposit(user.ID, request.Amount)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to deposit"})
+				return
+			}
+
 			c.JSON(http.StatusOK, gin.H{
 				"message": "dummy deposit handler",
 				"todo":    "replace with balance increment query",
-				"user":    makeUserResponse(user),
+				"user":    makeUserResponse(updated),
 				"amount":  request.Amount,
 			})
 		})
@@ -280,10 +307,19 @@ func main() {
 				c.JSON(http.StatusUnauthorized, gin.H{"message": "invalid authorization token"})
 				return
 			}
+			if !ok {
+				c.JSON(http.StatusUnauthorized, gin.H{"message": "invalid authorization token"})
+				return
+			}
+
+			if user.Balance < request.Amount {
+				c.JSON(http.StatusBadRequest, gin.H{"message": "no money"})
+				return
+			}
 
 			c.JSON(http.StatusOK, gin.H{
-				"message": "dummy withdraw handler",
-				"todo":    "replace with balance check and decrement query",
+				"message": "잔액",
+				"todo":    user.Balance - request.Amount,
 				"user":    makeUserResponse(user),
 				"amount":  request.Amount,
 			})
@@ -327,20 +363,12 @@ func main() {
 				return
 			}
 
-			c.JSON(http.StatusOK, PostListResponse{
-				Posts: []PostView{
-					{
-						ID:          1,
-						Title:       "Dummy Post",
-						Content:     "This is a fixed dummy response. Replace this later with real board logic.",
-						OwnerID:     1,
-						Author:      "Alice Admin",
-						AuthorEmail: "alice.admin@example.com",
-						CreatedAt:   "2026-03-19T09:00:00Z",
-						UpdatedAt:   "2026-03-19T09:00:00Z",
-					},
-				},
-			})
+			posts, err := store.findAllPosts()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to load"})
+				return
+			}
+			c.JSON(http.StatusOK, PostListResponse{Posts: posts})
 		})
 
 		protected.POST("/posts", func(c *gin.Context) {
@@ -361,21 +389,12 @@ func main() {
 				return
 			}
 
-			now := time.Now().Format(time.RFC3339)
-			c.JSON(http.StatusCreated, gin.H{
-				"message": "dummy create post handler",
-				"todo":    "replace with insert query",
-				"post": PostView{
-					ID:          1,
-					Title:       strings.TrimSpace(request.Title),
-					Content:     strings.TrimSpace(request.Content),
-					OwnerID:     user.ID,
-					Author:      user.Name,
-					AuthorEmail: user.Email,
-					CreatedAt:   now,
-					UpdatedAt:   now,
-				},
-			})
+			post, err := store.createPost(user.ID, request)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to create post"})
+				return
+			}
+			c.JSON(http.StatusCreated, PostResponse{Post: post})
 		})
 
 		protected.GET("/posts/:id", func(c *gin.Context) {
@@ -389,18 +408,23 @@ func main() {
 				return
 			}
 
-			c.JSON(http.StatusOK, PostResponse{
-				Post: PostView{
-					ID:          1,
-					Title:       "Dummy Post",
-					Content:     "This is a fixed dummy response. Replace this later with real board logic.",
-					OwnerID:     1,
-					Author:      "Alice Admin",
-					AuthorEmail: "alice.admin@example.com",
-					CreatedAt:   "2026-03-19T09:00:00Z",
-					UpdatedAt:   "2026-03-19T09:00:00Z",
-				},
-			})
+			idStr := c.Param("id")
+			var id uint
+			if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"message": "invalid post id"})
+				return
+			}
+
+			post, ok, err := store.findPostByID(id)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to load post"})
+				return
+			}
+			if !ok {
+				c.JSON(http.StatusNotFound, gin.H{"message": "post not found"})
+				return
+			}
+			c.JSON(http.StatusOK, PostResponse{Post: post})
 		})
 
 		protected.PUT("/posts/:id", func(c *gin.Context) {
@@ -522,6 +546,43 @@ func (s *Store) findUserByUsername(username string) (User, bool, error) {
 	return user, true, nil
 }
 
+func (s *Store) createUser(req RegisterRequest) (User, error) {
+	result, err := s.db.Exec(`
+        INSERT INTO users (username, name, email, phone, password, balance, is_admin)
+        VALUES (?, ?, ?, ?, ?, 0, 0)
+    `, strings.TrimSpace(req.Username),
+		strings.TrimSpace(req.Name),
+		strings.TrimSpace(req.Email),
+		strings.TrimSpace(req.Phone),
+		req.Password)
+	if err != nil {
+		return User{}, err
+	}
+
+	id, err := result.LastInsertId()
+	if err != nil {
+		return User{}, err
+	}
+
+	return User{
+		ID:       uint(id),
+		Username: strings.TrimSpace(req.Username),
+		Name:     strings.TrimSpace(req.Name),
+		Email:    strings.TrimSpace(req.Email),
+		Phone:    strings.TrimSpace(req.Phone),
+		Balance:  0,
+		IsAdmin:  false,
+	}, nil
+}
+
+func (s *Store) deleteUser(username string) error {
+	_, err := s.db.Exec(`
+        DELETE FROM users
+        WHERE username = ?
+    `, strings.TrimSpace(username))
+	return err
+}
+
 func newSessionStore() *SessionStore {
 	return &SessionStore{
 		tokens: make(map[string]User),
@@ -601,4 +662,172 @@ func newSessionToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buffer), nil
+}
+
+func (s *Store) findAllPosts() ([]PostView, error) {
+	rows, err := s.db.Query(`
+		SELECT p.id, p.title, p.content, p.owner_id, u.name, u.email, p.created_at, p.updated_at
+		FROM posts p
+		JOIN users u ON p.owner_id = u.id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var posts []PostView
+	for rows.Next() {
+		var p PostView
+		if err := rows.Scan(&p.ID, &p.Title, &p.Content, &p.OwnerID, &p.Author, &p.AuthorEmail, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			return nil, err
+		}
+		posts = append(posts, p)
+	}
+	return posts, nil
+}
+
+func (s *Store) findPostByID(id uint) (PostView, bool, error) {
+	row := s.db.QueryRow(`
+		SELECT p.id, p.title, p.content, p.owner_id, u.name, u.email, p.created_at, p.updated_at
+		FROM posts p
+		JOIN users u ON p.owner_id = u.id
+		WHERE p.id = ?
+	`, id)
+
+	var p PostView
+	if err := row.Scan(&p.ID, &p.Title, &p.Content, &p.OwnerID, &p.Author, &p.AuthorEmail, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return PostView{}, false, nil
+		}
+		return PostView{}, false, err
+	}
+	return p, true, nil
+}
+
+func (s *Store) createPost(ownerID uint, req CreatePostRequest) (PostView, error) {
+	result, err := s.db.Exec(`
+		INSERT INTO posts (title, content, owner_id)
+		VALUES (?, ?, ?)
+	`, strings.TrimSpace(req.Title), strings.TrimSpace(req.Content), ownerID)
+	if err != nil {
+		return PostView{}, err
+	}
+
+	id, err := result.LastInsertId()
+	if err != nil {
+		return PostView{}, err
+	}
+
+	post, _, err := s.findPostByID(uint(id))
+	return post, err
+}
+
+func (s *Store) updatePost(id uint, ownerID uint, req UpdatePostRequest) (PostView, error) {
+	_, err := s.db.Exec(`
+		UPDATE posts
+		SET title = ?, content = ?, updated_at = datetime('now')
+		WHERE id = ? AND owner_id = ?
+	`, strings.TrimSpace(req.Title), strings.TrimSpace(req.Content), id, ownerID)
+	if err != nil {
+		return PostView{}, err
+	}
+
+	post, _, err := s.findPostByID(id)
+	return post, err
+}
+
+func (s *Store) deletePost(id uint, ownerID uint) error {
+	_, err := s.db.Exec(`
+		DELETE FROM posts WHERE id = ? AND owner_id = ?
+	`, id, ownerID)
+	return err
+}
+
+func (s *Store) deposit(userID uint, amount int64) (User, error) {
+	_, err := s.db.Exec(`
+		UPDATE users SET balance = balance + ? WHERE id = ?
+	`, amount, userID)
+	if err != nil {
+		return User{}, err
+	}
+
+	row := s.db.QueryRow(`
+		SELECT id, username, name, email, phone, password, balance, is_admin
+		FROM users WHERE id = ?
+	`, userID)
+
+	var user User
+	var isAdmin int64
+	if err := row.Scan(&user.ID, &user.Username, &user.Name, &user.Email, &user.Phone, &user.Password, &user.Balance, &isAdmin); err != nil {
+		return User{}, err
+	}
+	return user, nil
+}
+
+func (s *Store) withdraw(userID uint, amount int64) (User, error) {
+	var balance int64
+	err := s.db.QueryRow(`SELECT balance FROM users WHERE id = ?`, userID).Scan(&balance)
+	if err != nil {
+		return User{}, err
+	}
+	if balance < amount {
+		return User{}, errors.New("unbalance")
+	}
+
+	_, err = s.db.Exec(`
+		UPDATE users SET balance = balance - ? WHERE id = ?
+	`, amount, userID)
+	if err != nil {
+		return User{}, err
+	}
+
+	row := s.db.QueryRow(`
+		SELECT id, username, name, email, phone, password, balance, is_admin
+		FROM users WHERE id = ?
+	`, userID)
+
+	var user User
+	var isAdmin int64
+	if err := row.Scan(&user.ID, &user.Username, &user.Name, &user.Email, &user.Phone, &user.Password, &user.Balance, &isAdmin); err != nil {
+		return User{}, err
+	}
+	return user, nil
+}
+
+func (s *Store) transfer(fromID uint, toUsername string, amount int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var balance int64
+	err = tx.QueryRow(`SELECT balance FROM users WHERE id = ?`, fromID).Scan(&balance)
+	if err != nil {
+		return err
+	}
+	if balance < amount {
+		return errors.New("unbalance")
+	}
+
+	var toID uint
+	err = tx.QueryRow(`SELECT id FROM users WHERE username = ?`, strings.TrimSpace(toUsername)).Scan(&toID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errors.New("user not found")
+		}
+		return err
+	}
+
+	_, err = tx.Exec(`UPDATE users SET balance = balance - ? WHERE id = ?`, amount, fromID)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.Exec(`UPDATE users SET balance = balance + ? WHERE id = ?`, amount, toID)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
